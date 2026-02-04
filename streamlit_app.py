@@ -3,13 +3,13 @@ from __future__ import annotations
 import pickle
 from pathlib import Path
 from typing import Any
-
+import gzip
 import pandas as pd
 import requests
 import streamlit as st
 
 
-MODEL_PATH = Path("models/rf-idealista.pickle")
+MODEL_PATH = Path("models/rf-idealista.pickle.gz")
 GEOCODE_URL = "https://nominatim.openstreetmap.org/search"
 YELLOW = "#FFFFFF"
 MAGENTA = "#b3206e"
@@ -95,8 +95,9 @@ def inject_custom_css() -> None:
 
 @st.cache_resource
 def load_model(model_path: Path) -> Any:
-    with model_path.open("rb") as f:
+    with gzip.open(model_path, "rb") as f:
         return pickle.load(f)
+        
 
 
 def geocode_address(address: str) -> tuple[float, float] | None:
@@ -144,6 +145,21 @@ def build_feature_row(values: dict[str, Any], model: Any) -> pd.DataFrame:
     return row_df[feature_order]
 
 
+def render_prices(container: Any, unit_price: float, total_price: float) -> None:
+    col1, col2 = container.columns(2)
+    col1.metric("Price/m²", f"{unit_price:,.0f} €/m²")
+    col2.metric("Price", f"{total_price:,.0f} €")
+
+
+def geocode_and_store(address: str) -> str | None:
+    point = geocode_address(address.strip())
+    if point is None:
+        return "No coordinates found for that address."
+    st.session_state.latitude, st.session_state.longitude = point
+    st.session_state.last_geocoded_address = address.strip()
+    return None
+
+
 def main() -> None:
     st.set_page_config(page_title="Idealista House Valuator", layout="wide")
     inject_custom_css()
@@ -160,6 +176,10 @@ def main() -> None:
         st.session_state.latitude = 40.4168
     if "longitude" not in st.session_state:
         st.session_state.longitude = -3.7038
+    if "address_input" not in st.session_state:
+        st.session_state.address_input = ""
+    if "last_geocoded_address" not in st.session_state:
+        st.session_state.last_geocoded_address = ""
 
     map_col, options_col = st.columns([1, 2], gap="large")
 
@@ -172,11 +192,13 @@ def main() -> None:
             }
         )
         st.map(map_df, zoom=14, use_container_width=True)
-        price_container = st.container()
+        price_container = st.container().empty()
         if "pred_unitprice" in st.session_state and "pred_total" in st.session_state:
-            p1, p2 = price_container.columns(2)
-            p2.metric("Price/m²", f"{st.session_state.pred_unitprice:,.0f} €/m²")
-            p2.metric("Price", f"{st.session_state.pred_total:,.0f} €")
+            render_prices(
+                price_container,
+                st.session_state.pred_unitprice,
+                st.session_state.pred_total,
+            )
 
     with options_col:
        # st.subheader("Property features")
@@ -246,17 +268,32 @@ def main() -> None:
             st.session_state.pred_unitprice = pred_unitprice
             st.session_state.pred_total = pred_total
 
-            p1, p2 = price_container.columns(2)
-            p1.metric("Price/m²", f"{pred_unitprice:,.0f} €/m²")
-            p2.metric("Price", f"{pred_total:,.0f} €")
+            render_prices(price_container, pred_unitprice, pred_total)
 
     st.session_state.latitude = latitude
     st.session_state.longitude = longitude
 
     #st.subheader("Search address")
     address_col, button_col = st.columns([4, 1], gap="small")
+
+    def geocode_from_input() -> None:
+        address_value = st.session_state.address_input.strip()
+        if not address_value or address_value == st.session_state.last_geocoded_address:
+            return
+        try:
+            geocode_and_store(address_value)
+        except requests.RequestException:
+            # Keep UI responsive on blur updates; explicit errors are shown on manual Search.
+            return
+
     with address_col:
-        address = st.text_input("Address", placeholder="Set the address, example: Calle de Alcalá 50, Madrid", label_visibility="collapsed")
+        address = st.text_input(
+            "Address",
+            placeholder="Set the address, example: Calle de Alcalá 50, Madrid",
+            label_visibility="collapsed",
+            key="address_input",
+            on_change=geocode_from_input,
+        )
     with button_col:
         search_clicked = st.button("Search", use_container_width=True)
 
@@ -265,13 +302,12 @@ def main() -> None:
             st.warning("Please enter an address.")
         else:
             try:
-                point = geocode_address(address.strip())
-                if point is None:
-                    st.warning("No coordinates found for that address.")
+                error = geocode_and_store(address)
+                if error:
+                    st.warning(error)
                 else:
-                    st.session_state.latitude, st.session_state.longitude = point
                     st.success(
-                        f"Coordinates loaded: lat={point[0]:.6f}, lon={point[1]:.6f}"
+                        f"Coordinates loaded: lat={st.session_state.latitude:.6f}, lon={st.session_state.longitude:.6f}"
                     )
                     st.rerun()
             except requests.RequestException as exc:
