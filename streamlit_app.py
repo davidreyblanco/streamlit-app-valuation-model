@@ -4,12 +4,18 @@ import pickle
 from pathlib import Path
 from typing import Any
 import gzip
+import numpy as np
 import pandas as pd
+import pydeck as pdk
 import requests
 import streamlit as st
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from matplotlib import colors as mcolors
 
 
 MODEL_PATH = Path("models/rf-idealista.pickle.gz")
+RASTER_PATH = Path("raster/unitprice_grid_100x100.tif")
 GEOCODE_URL = "https://nominatim.openstreetmap.org/search"
 YELLOW = "#FFFFFF"
 MAGENTA = "#b3206e"
@@ -160,6 +166,146 @@ def geocode_and_store(address: str) -> str | None:
     return None
 
 
+@st.cache_data
+def load_raster_overlay(raster_path: Path) -> dict[str, Any] | None:
+    try:
+        import rasterio
+        from pyproj import Transformer
+    except ImportError:
+        return None
+
+    with rasterio.open(raster_path) as src:
+        band = src.read(1, masked=True).astype("float32")
+        if np.ma.count(band) == 0:
+            return None
+
+        valid_values = band.compressed()
+        positive_values = valid_values[valid_values > 0]
+        if positive_values.size == 0:
+            return None
+
+        vmin, vmax = np.nanpercentile(positive_values, [1, 99.4])
+        if vmin <= 0:
+            vmin = float(np.nanmin(positive_values))
+        if vmin >= vmax:
+            vmax = float(np.nanmax(positive_values))
+        if vmin >= vmax:
+            vmax = vmin * 1.01
+
+        # Emphasize high-end differences by stretching the upper range.
+        high_end_gamma = 1.5
+        norm = mcolors.PowerNorm(gamma=high_end_gamma, vmin=vmin, vmax=vmax, clip=True)
+        cmap = cm.get_cmap("inferno")
+
+        if src.crs is None:
+            return None
+        transformer = Transformer.from_crs(src.crs, "EPSG:4326", always_xy=True)
+        mask = np.ma.getmaskarray(band)
+
+        rows, cols = band.shape
+        cells: list[dict[str, Any]] = []
+        for row in range(rows):
+            for col in range(cols):
+                if mask[row, col]:
+                    continue
+                value = float(band[row, col])
+                color_value = max(value, vmin)
+                color = (np.array(cmap(norm(color_value))) * 255).astype(np.uint8)
+
+                x_left, y_top = src.transform * (col, row)
+                x_right, y_bottom = src.transform * (col + 1, row + 1)
+
+                lon_tl, lat_tl = transformer.transform(x_left, y_top)
+                lon_tr, lat_tr = transformer.transform(x_right, y_top)
+                lon_br, lat_br = transformer.transform(x_right, y_bottom)
+                lon_bl, lat_bl = transformer.transform(x_left, y_bottom)
+
+                cells.append(
+                    {
+                        "polygon": [
+                            [lon_tl, lat_tl],
+                            [lon_tr, lat_tr],
+                            [lon_br, lat_br],
+                            [lon_bl, lat_bl],
+                        ],
+                        "fill_color": [int(color[0]), int(color[1]), int(color[2]), 130],
+                    }
+                )
+
+    return {
+        "cells": cells,
+        "vmin": float(vmin),
+        "vmax": float(vmax),
+        "gamma": float(high_end_gamma),
+        "scale": f"power(gamma={high_end_gamma})",
+    }
+
+
+def render_map(latitude: float, longitude: float, raster_overlay: dict[str, Any] | None) -> None:
+    layers = []
+    if raster_overlay and raster_overlay.get("cells"):
+        layers.append(
+            pdk.Layer(
+                "PolygonLayer",
+                data=raster_overlay["cells"],
+                get_polygon="polygon",
+                get_fill_color="fill_color",
+                stroked=False,
+                filled=True,
+                pickable=False,
+            )
+        )
+
+    layers.append(
+        pdk.Layer(
+            "ScatterplotLayer",
+            data=[{"lat": latitude, "lon": longitude}],
+            get_position="[lon, lat]",
+            get_fill_color=[179, 32, 110, 255],
+            get_radius=50,
+            radius_min_pixels=8,
+            radius_max_pixels=16,
+            pickable=False,
+        )
+    )
+
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=layers,
+            initial_view_state=pdk.ViewState(
+                latitude=latitude,
+                longitude=longitude,
+                zoom=13.8,
+                pitch=0,
+            ),
+            map_provider="carto",
+            map_style="light",
+        ),
+        use_container_width=True,
+    )
+
+
+def render_raster_legend(raster_overlay: dict[str, Any]) -> None:
+    vmin = float(1000.0)
+    vmax = float(raster_overlay["vmax"])
+    gamma = float(raster_overlay.get("gamma", 0.8))
+
+    fig, ax = plt.subplots(figsize=(5.6, 0.55))
+    fig.patch.set_alpha(0)
+    ax.set_axis_off()
+
+    norm = mcolors.PowerNorm(gamma=gamma, vmin=vmin, vmax=vmax, clip=True)
+    sm = cm.ScalarMappable(norm=norm, cmap=cm.get_cmap("inferno"))
+    cbar = fig.colorbar(sm, ax=ax, orientation="horizontal", fraction=1.0, pad=0.0)
+    cbar.set_ticks([vmin, (vmin + vmax) / 2.0, vmax])
+    cbar.set_ticklabels([f"{vmin:,.0f} €/m²", f"{(vmin + vmax) / 2.0:,.0f} €/m²", f"{vmax:,.0f} €/m²"])
+    cbar.ax.tick_params(labelsize=8, length=0, pad=1)
+    #cbar.set_label("Unit price (€/m²)", fontsize=9, labelpad=2)
+
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
 def main() -> None:
     st.set_page_config(page_title="Idealista House Valuator", layout="wide")
     inject_custom_css()
@@ -171,6 +317,7 @@ def main() -> None:
         st.stop()
 
     model = load_model(MODEL_PATH)
+    raster_overlay = load_raster_overlay(RASTER_PATH) if RASTER_PATH.exists() else None
 
     if "latitude" not in st.session_state:
         st.session_state.latitude = 40.4168
@@ -185,13 +332,20 @@ def main() -> None:
 
     with map_col:
         #st.subheader("Location map")
-        map_df = pd.DataFrame(
-            {
-                "lat": [float(st.session_state.latitude)],
-                "lon": [float(st.session_state.longitude)],
-            }
+        show_raster = st.toggle("Show unit price raster overlay", value=True)
+        render_map(
+            float(st.session_state.latitude),
+            float(st.session_state.longitude),
+            raster_overlay if show_raster else None,
         )
-        st.map(map_df, zoom=14, use_container_width=True)
+        if show_raster and RASTER_PATH.exists() and raster_overlay:
+            if False:
+                st.caption(
+                f"Raster overlay (unit price €/m², balanced high-end scale): ~P1 {raster_overlay['vmin']:.0f} to ~P99.4 {raster_overlay['vmax']:.0f}"
+                )
+            render_raster_legend(raster_overlay)
+        elif show_raster and RASTER_PATH.exists() and not raster_overlay:
+            st.caption("Raster found but unavailable (install `rasterio` to enable overlay).")
         price_container = st.container().empty()
         if "pred_unitprice" in st.session_state and "pred_total" in st.session_state:
             render_prices(
@@ -204,9 +358,9 @@ def main() -> None:
        # st.subheader("Property features")
         col1, col2, col3 = st.columns(3)
         with col1:
-            roomnumber = st.number_input("Rooms", min_value=0, max_value=20, value=2, step=1)
+            roomnumber = st.number_input("Rooms", min_value=1, max_value=10, value=2, step=1)
             constructedarea = st.number_input(
-                "Constructed area (m²)", min_value=15.0, max_value=1500.0, value=90.0, step=1.0
+                "Constructed area (m²)", min_value=35.0, max_value=300.0, value=90.0, step=1.0
             )
             floorclean = st.number_input("Floor", min_value=-2.0, max_value=80.0, value=2.0, step=1.0)
             cadconstructionyear = st.number_input(
@@ -216,9 +370,29 @@ def main() -> None:
                 "Flat location id", min_value=0, max_value=15, value=2, step=1
             )
         with col2:
-            cadastralqualityid = st.number_input(
-                "Cadastral quality id", min_value=1, max_value=10, value=5, step=1
+            build_type_options = {
+                "1 - New / Renewed": 1,
+                "2 - 2nd Hand Good Condition": 2,
+                "3 - 2nd hand To Renovate": 3,
+            }
+            cadastral_quality_options = {
+                "1 - Excellent (Best quality)": 1,
+                "2 - Very high": 2,
+                "3 - High": 3,
+                "4 - Upper-mid": 4,
+                "5 - Mid (Default)": 5,
+                "6 - Lower-mid": 6,
+                "7 - Low": 7,
+                "8 - Very low": 8,
+                "9 - Poor": 9,
+                "10 - Very poor (Worst quality)": 10,
+            }
+            selected_cadastral_quality = st.selectbox(
+                "Cadastral quality id",
+                options=list(cadastral_quality_options.keys()),
+                index=4,
             )
+            cadastralqualityid = cadastral_quality_options[selected_cadastral_quality]
             distance_to_metro = st.number_input(
                 "Distance to metro (meters)", min_value=0.0, max_value=10000.0, value=400.0, step=10.0
             )
@@ -236,7 +410,10 @@ def main() -> None:
                 value=float(st.session_state.longitude),
                 format="%.6f",
             )
-            buildtypeid = st.selectbox("Built type", options=[1, 2, 3], index=0)
+            selected_build_type = st.selectbox(
+                "Built type", options=list(build_type_options.keys()), index=0
+            )
+            buildtypeid = build_type_options[selected_build_type]
         with col3:
             haslift = st.checkbox("Lift", value=True)
             hasterrace = st.checkbox("Terrace", value=False)
@@ -312,6 +489,14 @@ def main() -> None:
                     st.rerun()
             except requests.RequestException as exc:
                 st.error(f"Geocoding service error: {exc}")
+
+    st.markdown("---")
+    st.caption(
+        "Reference: Rey-Blanco, D., Arbues, P., et al., and Paez, A. "
+        "(2024). *A geo-referenced micro-data set of real estate listings for Spain's three largest cities*. "
+        "Environment and Planning B: Urban Analytics and City Science, 51(6). "
+        "https://doi.org/10.1177/23998083241242844"
+    )
 
 
 if __name__ == "__main__":
