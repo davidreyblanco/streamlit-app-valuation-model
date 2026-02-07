@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import pickle
 from pathlib import Path
 from typing import Any
@@ -13,9 +14,11 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from matplotlib import colors as mcolors
 
+import src.geo_data as geo_data
 
 MODEL_PATH = Path("models/rf-idealista.pickle.gz")
 RASTER_PATH = Path("raster/unitprice_grid_100x100.tif")
+ICON_PATH = Path("img/icons8-home-50.png")
 GEOCODE_URL = "https://nominatim.openstreetmap.org/search"
 YELLOW = "#FFFFFF"
 MAGENTA = "#b3206e"
@@ -41,7 +44,6 @@ DEFAULT_FEATURE_ORDER = [
     "LATITUDE",
     "LONGITUDE",
 ]
-
 
 def inject_custom_css() -> None:
     st.markdown(
@@ -103,7 +105,98 @@ def inject_custom_css() -> None:
 def load_model(model_path: Path) -> Any:
     with gzip.open(model_path, "rb") as f:
         return pickle.load(f)
-        
+
+
+@st.cache_data
+def load_icon_data_url(icon_path: Path) -> str | None:
+    if not icon_path.exists():
+        return None
+    encoded = base64.b64encode(icon_path.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+@st.cache_data
+def load_osm_pois(city_name: str = "Madrid") -> Any:
+    return geo_data.load_osm_data(city_name=city_name, use_geopandas=True)
+
+
+def build_osm_points(osm_gdf: Any, selected_codes: list[str]) -> list[dict[str, Any]]:
+    if not selected_codes:
+        return []
+    df = osm_gdf[osm_gdf["CODE"].isin(selected_codes)].copy()
+    if df.empty:
+        return []
+    if "geometry" in df.columns:
+        df["lat"] = df.geometry.y
+        df["lon"] = df.geometry.x
+    else:
+        df["lat"] = df["LAT"]
+        df["lon"] = df["LNG"]
+    code_styles = {
+        "HEALTH": {"color": "#d62728", "shape": "health"},
+        "EDUCATION": {"color": "#1f77b4", "shape": "education"},
+        "TRANSPORT": {"color": "#2ca02c", "shape": "transport"},
+        "FOOD": {"color": "#ff7f0e", "shape": "food"},
+        "SHOP": {"color": "#9467bd", "shape": "shop"},
+        "SPORT": {"color": "#17becf", "shape": "sport"},
+    }
+    default_style = {"color": "#7f7f7f", "shape": "generic"}
+
+    def svg_icon(color: str, shape: str) -> dict[str, Any]:
+        if shape == "health":
+            glyph = (
+                "<rect x='17' y='9' width='6' height='22' rx='2' fill='#ffffff'/>"
+                "<rect x='9' y='17' width='22' height='6' rx='2' fill='#ffffff'/>"
+            )
+        elif shape == "education":
+            glyph = (
+                "<polygon points='20,9 34,16 20,23 6,16' fill='#ffffff'/>"
+                "<rect x='14' y='23' width='12' height='6' rx='2' fill='#ffffff'/>"
+            )
+        elif shape == "transport":
+            glyph = (
+                "<rect x='10' y='12' width='20' height='14' rx='3' fill='#ffffff'/>"
+                "<circle cx='14' cy='28' r='2.5' fill='#ffffff'/>"
+                "<circle cx='26' cy='28' r='2.5' fill='#ffffff'/>"
+            )
+        elif shape == "food":
+            glyph = (
+                "<rect x='12' y='9' width='3' height='18' rx='1' fill='#ffffff'/>"
+                "<rect x='17' y='9' width='2' height='8' rx='1' fill='#ffffff'/>"
+                "<rect x='21' y='9' width='2' height='8' rx='1' fill='#ffffff'/>"
+                "<rect x='25' y='9' width='2' height='8' rx='1' fill='#ffffff'/>"
+                "<rect x='24' y='17' width='3' height='10' rx='1' fill='#ffffff'/>"
+            )
+        elif shape == "shop":
+            glyph = (
+                "<rect x='10' y='14' width='20' height='14' rx='2' fill='#ffffff'/>"
+                "<rect x='13' y='10' width='14' height='4' rx='2' fill='#ffffff'/>"
+            )
+        elif shape == "sport":
+            glyph = (
+                "<circle cx='20' cy='20' r='8' fill='none' stroke='#ffffff' stroke-width='2'/>"
+                "<path d='M20 12 L20 28 M12 20 L28 20' stroke='#ffffff' stroke-width='2'/>"
+            )
+        else:
+            glyph = "<circle cx='20' cy='20' r='6' fill='#ffffff'/>"
+
+        svg = (
+            "<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40' viewBox='0 0 40 40'>"
+            f"<circle cx='20' cy='20' r='18' fill='{color}' stroke='#111' stroke-width='2'/>"
+            f"{glyph}</svg>"
+        )
+        encoded = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+        return {
+            "url": f"data:image/svg+xml;base64,{encoded}",
+            "width": 52,
+            "height": 52,
+            "anchorY": 52,
+        }
+
+    df["style"] = df["CODE"].apply(lambda c: code_styles.get(c, default_style))
+    df["icon"] = df["style"].apply(lambda s: svg_icon(s["color"], s["shape"]))
+    return df[["lat", "lon", "NOMBRE", "CODE", "SUBCODE", "icon"]].to_dict(orient="records")
+
 
 
 def geocode_address(address: str) -> tuple[float, float] | None:
@@ -158,7 +251,7 @@ def render_prices(container: Any, unit_price: float, total_price: float) -> None
 
 
 def geocode_and_store(address: str) -> str | None:
-    point = geocode_address(address.strip())
+    point = geocode_address(address.strip() + ', Madrid, Comunidad de Madrid, Spain')
     if point is None:
         return "No coordinates found for that address."
     st.session_state.latitude, st.session_state.longitude = point
@@ -241,7 +334,12 @@ def load_raster_overlay(raster_path: Path) -> dict[str, Any] | None:
     }
 
 
-def render_map(latitude: float, longitude: float, raster_overlay: dict[str, Any] | None) -> None:
+def render_map(
+    latitude: float,
+    longitude: float,
+    raster_overlay: dict[str, Any] | None,
+    osm_points: list[dict[str, Any]] | None,
+) -> None:
     layers = []
     if raster_overlay and raster_overlay.get("cells"):
         layers.append(
@@ -256,32 +354,86 @@ def render_map(latitude: float, longitude: float, raster_overlay: dict[str, Any]
             )
         )
 
-    layers.append(
-        pdk.Layer(
-            "ScatterplotLayer",
-            data=[{"lat": latitude, "lon": longitude}],
-            get_position="[lon, lat]",
-            get_fill_color=[179, 32, 110, 255],
-            get_radius=50,
-            radius_min_pixels=8,
-            radius_max_pixels=16,
-            pickable=False,
+    if osm_points:
+        layers.append(
+            pdk.Layer(
+                "IconLayer",
+                data=osm_points,
+                get_position="[lon, lat]",
+                get_icon="icon",
+                get_size=1,
+                size_scale=6,
+                pickable=True,
+            )
         )
-    )
 
-    st.pydeck_chart(
-        pdk.Deck(
-            layers=layers,
-            initial_view_state=pdk.ViewState(
-                latitude=latitude,
-                longitude=longitude,
-                zoom=13.8,
-                pitch=0,
-            ),
-            map_provider="carto",
-            map_style="light",
+    icon_url = load_icon_data_url(ICON_PATH)
+    if icon_url:
+        layers.append(
+            pdk.Layer(
+                "IconLayer",
+                data=[
+                    {
+                        "lat": latitude,
+                        "lon": longitude,
+                        "icon": {
+                            "url": icon_url,
+                            "width": 10,
+                            "height": 10,
+                            "anchorY": 25,
+                        },
+                        "size": 6,
+                    }
+                ],
+                get_position="[lon, lat]",
+                get_icon="icon",
+                get_size="size",
+                size_scale=4,
+                pickable=False,
+            )
+        )
+    else:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=[{"lat": latitude, "lon": longitude}],
+                get_position="[lon, lat]",
+                get_fill_color=[179, 32, 110, 255],
+                get_radius=50,
+                radius_min_pixels=8,
+                radius_max_pixels=16,
+                pickable=False,
+            )
+        )
+
+    tooltip = None
+    if osm_points:
+        tooltip = {
+            "html": "<b>{NOMBRE}</b><br/>CODE: {CODE}<br/>SUBCODE: {SUBCODE}",
+            "style": {
+                "backgroundColor": "rgba(255, 255, 255, 0.95)",
+                "color": "black",
+                "fontSize": "12px",
+                "padding": "6px 8px",
+            },
+        }
+
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=pdk.ViewState(
+            latitude=latitude,
+            longitude=longitude,
+            zoom=13.8,
+            pitch=0,
         ),
+        map_provider="carto",
+        map_style="light",
+        tooltip=tooltip,
+    )
+    st.pydeck_chart(
+        deck,
         use_container_width=True,
+        key="location_map",
     )
 
 
@@ -332,11 +484,23 @@ def main() -> None:
 
     with map_col:
         #st.subheader("Location map")
-        show_raster = st.toggle("Show unit price raster overlay", value=True)
+        toggle_col1, toggle_col2 = st.columns(2)
+        with toggle_col1:
+            show_raster = st.toggle("Show unit price raster overlay", value=True)
+        with toggle_col2:
+            show_pois = st.toggle("Show OSM POIs", value=False)
+        osm_points = None
+        if show_pois:
+            osm_data_gdf = load_osm_pois("Madrid")
+            codes = sorted(osm_data_gdf["CODE"].dropna().unique().tolist())
+            default_codes = [code for code in ("HEALTH", "EDUCATION", "TRANSPORT") if code in codes]
+            selected_codes = st.multiselect("POI codes", options=codes, default=default_codes)
+            osm_points = build_osm_points(osm_data_gdf, selected_codes)
         render_map(
             float(st.session_state.latitude),
             float(st.session_state.longitude),
             raster_overlay if show_raster else None,
+            osm_points,
         )
         if show_raster and RASTER_PATH.exists() and raster_overlay:
             if False:
